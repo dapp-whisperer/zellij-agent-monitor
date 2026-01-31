@@ -14,9 +14,17 @@ pub extern "C" fn _start() {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentStatus {
-    Running,   // Active (includes starting state)
-    Completed, // Exited with code 0
-    Failed,    // Exited with non-zero code
+    Idle,        // Waiting for user input
+    Working,     // Tool in progress
+    NeedsInput,  // Waiting for approval
+    Completed,   // Exited with code 0
+    Failed,      // Exited with non-zero code
+}
+
+impl Default for AgentStatus {
+    fn default() -> Self {
+        AgentStatus::Idle
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +39,37 @@ pub struct State {
     pub agents: Vec<Agent>,
     pub selected: usize,
     pub agent_counter: u32,
+    pub spinner_frame: usize,
+}
+
+// Spinner frames for working indicator
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+// Status file directory
+const STATUS_DIR: &str = "/tmp/agent-monitor";
+
+/// Reads agent status from file. Returns None if file doesn't exist or is invalid.
+fn read_agent_status(pane_id: u32) -> Option<AgentStatus> {
+    let path = format!("{}/{}.status", STATUS_DIR, pane_id);
+
+    match std::fs::read_to_string(&path) {
+        Ok(content) => match content.trim() {
+            "W" => Some(AgentStatus::Working),
+            "I" => Some(AgentStatus::Idle),
+            "?" => Some(AgentStatus::NeedsInput),
+            _ => None, // Unknown, keep current state
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            None // File doesn't exist yet, keep current state
+        }
+        Err(_) => None, // Read error, keep current state
+    }
+}
+
+/// Deletes the status file for an agent
+fn delete_status_file(pane_id: u32) {
+    let path = format!("{}/{}.status", STATUS_DIR, pane_id);
+    let _ = std::fs::remove_file(path);
 }
 
 // =============================================================================
@@ -78,7 +117,7 @@ impl ZellijPlugin for AgentMonitorPlugin {
                     self.state.agents.push(Agent {
                         pane_id,
                         title,
-                        status: AgentStatus::Running,
+                        status: AgentStatus::Idle, // Start as Idle - waiting for user input
                     });
                 }
                 true
@@ -108,7 +147,15 @@ impl ZellijPlugin for AgentMonitorPlugin {
                         .map(|a| a.pane_id == id)
                         .unwrap_or(false);
 
+                    // Check if this was one of our agents before removing
+                    let was_our_agent = self.state.agents.iter().any(|a| a.pane_id == id);
+
                     self.state.agents.retain(|a| a.pane_id != id);
+
+                    // Clean up status file if it was our agent
+                    if was_our_agent {
+                        delete_status_file(id);
+                    }
 
                     // Adjust selection if needed
                     if was_selected && !self.state.agents.is_empty() {
@@ -119,9 +166,28 @@ impl ZellijPlugin for AgentMonitorPlugin {
             }
 
             Event::Timer(_) => {
-                // Keep timer running for future use (e.g., when scrollback API available)
-                set_timeout(5.0);
-                false
+                // Advance spinner
+                self.state.spinner_frame = (self.state.spinner_frame + 1) % SPINNER.len();
+
+                // Poll status files for all active agents
+                self.poll_status_files();
+
+                // Adaptive polling: fast when working, slow when all idle
+                let has_working = self
+                    .state
+                    .agents
+                    .iter()
+                    .any(|a| a.status == AgentStatus::Working);
+
+                set_timeout(if has_working { 0.1 } else { 0.5 });
+
+                // Re-render if there's a working agent (spinner) or needs input
+                has_working
+                    || self
+                        .state
+                        .agents
+                        .iter()
+                        .any(|a| a.status == AgentStatus::NeedsInput)
             }
 
             Event::Key(key) => self.handle_key(key),
@@ -142,15 +208,20 @@ impl ZellijPlugin for AgentMonitorPlugin {
         } else {
             for (i, agent) in self.state.agents.iter().enumerate() {
                 let marker = if i == self.state.selected { "▶" } else { " " };
-                let status = match agent.status {
-                    AgentStatus::Running => "[R]",
-                    AgentStatus::Completed => "[✓]",
-                    AgentStatus::Failed => "[X]",
+                let (status_str, _color_idx) = match agent.status {
+                    AgentStatus::Idle => ("[·]".to_string(), 0),         // cyan
+                    AgentStatus::Working => {
+                        let spinner = SPINNER[self.state.spinner_frame];
+                        (format!("[{}]", spinner), 2)                    // yellow
+                    }
+                    AgentStatus::NeedsInput => ("[?]".to_string(), 3),   // orange
+                    AgentStatus::Completed => ("[✓]".to_string(), 1),    // green
+                    AgentStatus::Failed => ("[X]".to_string(), 3),       // red
                 };
                 // Truncate title if needed
                 let max_title_len = cols.saturating_sub(10);
                 let title: String = agent.title.chars().take(max_title_len).collect();
-                println!("{} {} {}", marker, status, title);
+                println!("{} {} {}", marker, status_str, title);
             }
         }
 
@@ -166,6 +237,20 @@ impl ZellijPlugin for AgentMonitorPlugin {
 // =============================================================================
 
 impl AgentMonitorPlugin {
+    /// Polls status files for all non-terminal agents and updates their status
+    fn poll_status_files(&mut self) {
+        for agent in &mut self.state.agents {
+            // Don't poll terminal states
+            if matches!(agent.status, AgentStatus::Completed | AgentStatus::Failed) {
+                continue;
+            }
+
+            if let Some(new_status) = read_agent_status(agent.pane_id) {
+                agent.status = new_status;
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
         match key.bare_key {
             BareKey::Char('j') | BareKey::Down => {
