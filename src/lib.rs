@@ -26,11 +26,20 @@ pub struct Agent {
     pub status: AgentStatus,
 }
 
+#[derive(Default, Debug, Clone, PartialEq)]
+pub enum InputMode {
+    #[default]
+    Normal,
+    Rename,
+}
+
 #[derive(Default)]
 pub struct State {
     pub agents: Vec<Agent>,
     pub selected: usize,
     pub agent_counter: u32,
+    pub mode: InputMode,
+    pub input_buffer: String,
 }
 
 // =============================================================================
@@ -142,10 +151,11 @@ impl ZellijPlugin for AgentMonitorPlugin {
         } else {
             for (i, agent) in self.state.agents.iter().enumerate() {
                 let marker = if i == self.state.selected { "▶" } else { " " };
+                // Color-coded status: green=completed, red=failed, yellow=running
                 let status = match agent.status {
-                    AgentStatus::Running => "[R]",
-                    AgentStatus::Completed => "[✓]",
-                    AgentStatus::Failed => "[X]",
+                    AgentStatus::Running => "\x1b[33m[R]\x1b[0m",   // Yellow
+                    AgentStatus::Completed => "\x1b[32m[✓]\x1b[0m", // Green
+                    AgentStatus::Failed => "\x1b[31m[X]\x1b[0m",    // Red
                 };
                 // Truncate title if needed
                 let max_title_len = cols.saturating_sub(10);
@@ -155,9 +165,20 @@ impl ZellijPlugin for AgentMonitorPlugin {
         }
 
         println!();
-        let footer = "─ n:new  ↵:focus  x:kill  q:hide ";
-        let footer_padding = "─".repeat(cols.saturating_sub(footer.len()));
-        println!("{}{}", footer, footer_padding);
+
+        // Show rename input or normal footer
+        match self.state.mode {
+            InputMode::Rename => {
+                let prompt = format!("Rename: {}█", self.state.input_buffer);
+                let hint = " (Enter=save, Esc=cancel)";
+                println!("{}{}", prompt, hint);
+            }
+            InputMode::Normal => {
+                let footer = "─ n:new  r:rename  ↵:focus  x:kill  q:hide ";
+                let footer_padding = "─".repeat(cols.saturating_sub(footer.len()));
+                println!("{}{}", footer, footer_padding);
+            }
+        }
     }
 }
 
@@ -167,6 +188,13 @@ impl ZellijPlugin for AgentMonitorPlugin {
 
 impl AgentMonitorPlugin {
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
+        match self.state.mode {
+            InputMode::Normal => self.handle_normal_key(key),
+            InputMode::Rename => self.handle_rename_key(key),
+        }
+    }
+
+    fn handle_normal_key(&mut self, key: KeyWithModifier) -> bool {
         match key.bare_key {
             BareKey::Char('j') | BareKey::Down => {
                 if !self.state.agents.is_empty() {
@@ -194,6 +222,17 @@ impl AgentMonitorPlugin {
                 true
             }
 
+            BareKey::Char('r') => {
+                if !self.state.agents.is_empty() {
+                    // Start rename with current title as initial value
+                    if let Some(agent) = self.state.agents.get(self.state.selected) {
+                        self.state.input_buffer = agent.title.clone();
+                    }
+                    self.state.mode = InputMode::Rename;
+                }
+                true
+            }
+
             BareKey::Char('x') => {
                 if let Some(agent) = self.state.agents.get(self.state.selected) {
                     close_terminal_pane(agent.pane_id);
@@ -207,6 +246,41 @@ impl AgentMonitorPlugin {
             }
 
             _ => false,
+        }
+    }
+
+    fn handle_rename_key(&mut self, key: KeyWithModifier) -> bool {
+        match key.bare_key {
+            BareKey::Enter => {
+                // Confirm rename
+                if !self.state.input_buffer.is_empty() {
+                    if let Some(agent) = self.state.agents.get_mut(self.state.selected) {
+                        agent.title = self.state.input_buffer.clone();
+                    }
+                }
+                self.state.input_buffer.clear();
+                self.state.mode = InputMode::Normal;
+                true
+            }
+
+            BareKey::Esc => {
+                // Cancel rename
+                self.state.input_buffer.clear();
+                self.state.mode = InputMode::Normal;
+                true
+            }
+
+            BareKey::Backspace => {
+                self.state.input_buffer.pop();
+                true
+            }
+
+            BareKey::Char(c) => {
+                self.state.input_buffer.push(c);
+                true
+            }
+
+            _ => true, // Absorb other keys in rename mode
         }
     }
 
