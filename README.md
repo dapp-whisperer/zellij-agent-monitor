@@ -58,7 +58,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "mkdir -p /tmp/agent-monitor && F=/tmp/agent-monitor/${ZELLIJ_PANE_ID:-$$}.status && echo W > \"$F.tmp\" && mv \"$F.tmp\" \"$F\"",
+            "command": "mkdir -p /tmp/agent-monitor && F=/tmp/agent-monitor/${ZELLIJ_PANE_ID:-$$}.status && echo \"W:PreToolUse:$(pwd)\" > \"$F.tmp\" && mv \"$F.tmp\" \"$F\"",
             "timeout": 5000
           }
         ]
@@ -70,7 +70,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "F=/tmp/agent-monitor/${ZELLIJ_PANE_ID:-$$}.status && echo I > \"$F.tmp\" && mv \"$F.tmp\" \"$F\"",
+            "command": "F=/tmp/agent-monitor/${ZELLIJ_PANE_ID:-$$}.status && echo \"I:PostToolUse:$(pwd)\" > \"$F.tmp\" && mv \"$F.tmp\" \"$F\"",
             "timeout": 5000
           }
         ]
@@ -82,7 +82,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "F=/tmp/agent-monitor/${ZELLIJ_PANE_ID:-$$}.status && echo I > \"$F.tmp\" && mv \"$F.tmp\" \"$F\"",
+            "command": "F=/tmp/agent-monitor/${ZELLIJ_PANE_ID:-$$}.status && echo \"I:Stop:$(pwd)\" > \"$F.tmp\" && mv \"$F.tmp\" \"$F\"",
             "timeout": 5000
           }
         ]
@@ -94,7 +94,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "F=/tmp/agent-monitor/${ZELLIJ_PANE_ID:-$$}.status && echo '?' > \"$F.tmp\" && mv \"$F.tmp\" \"$F\"",
+            "command": "F=/tmp/agent-monitor/${ZELLIJ_PANE_ID:-$$}.status && echo \"?:Notification:$(pwd)\" > \"$F.tmp\" && mv \"$F.tmp\" \"$F\"",
             "timeout": 5000
           }
         ]
@@ -133,6 +133,20 @@ Verify `ZELLIJ_PANE_ID` is set in your shell. Run `echo $ZELLIJ_PANE_ID` in a Ze
 2. Claude Code hooks write status to `/tmp/agent-monitor/<pane_id>.status`
 3. Plugin polls status files every 100-500ms (adaptive)
 4. Status file is deleted when pane closes
+
+### Status File Format
+
+The status file supports multiple formats for flexibility:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| New format | `W:PreToolUse:/home/user/project` | Status + event name + working directory |
+| Current format | `W:/home/user/project` | Status + working directory (backward compatible) |
+| Legacy format | `W` | Status only (backward compatible) |
+
+**Status characters:** `W` (Working), `I` (Idle), `?` (NeedsInput)
+
+**Event names:** `PreToolUse`, `PostToolUse`, `Stop`, `Notification` (or any custom event)
 
 ## License
 

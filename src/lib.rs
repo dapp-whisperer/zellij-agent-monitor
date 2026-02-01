@@ -35,6 +35,7 @@ pub struct Agent {
     pub title: String,
     pub status: AgentStatus,
     pub cwd: Option<String>,
+    pub last_event: Option<String>,  // Last hook event that triggered status change
     pub created_tick: u64,       // For orphan cleanup timeout
 }
 
@@ -114,6 +115,7 @@ fn status_file_paths(agent_id: &str) -> (String, String) {
 enum StatusRead {
     Parsed {
         status: AgentStatus,
+        event_name: Option<String>,
         cwd: Option<String>,
     },
     Unrecognized,
@@ -146,27 +148,82 @@ fn read_agent_status(agent_id: &str) -> StatusRead {
 
 fn parse_status_content(content: &str) -> StatusRead {
     let content = content.trim();
-    // Try new format: "W:/path/to/cwd"
-    if let Some((status_char, cwd)) = content.split_once(':') {
-        let status = match status_char {
-            "W" => AgentStatus::Working,
-            "I" => AgentStatus::Idle,
-            "?" => AgentStatus::NeedsInput,
-            _ => return StatusRead::Unrecognized,
-        };
-        return StatusRead::Parsed {
-            status,
-            cwd: Some(cwd.to_string()),
-        };
-    }
-    // Fallback: legacy format without CWD
-    let status = match content {
-        "W" => AgentStatus::Working,
-        "I" => AgentStatus::Idle,
-        "?" => AgentStatus::NeedsInput,
-        _ => return StatusRead::Unrecognized,
+
+    let parse_status = |s: &str| match s {
+        "W" => Some(AgentStatus::Working),
+        "I" => Some(AgentStatus::Idle),
+        "?" => Some(AgentStatus::NeedsInput),
+        _ => None,
     };
-    StatusRead::Parsed { status, cwd: None }
+
+    let parts: Vec<&str> = content.splitn(3, ':').collect();
+
+    match parts.len() {
+        // Legacy format: "W"
+        1 => {
+            let status = match parse_status(parts[0]) {
+                Some(s) => s,
+                None => return StatusRead::Unrecognized,
+            };
+            StatusRead::Parsed {
+                status,
+                event_name: None,
+                cwd: None,
+            }
+        }
+        // Two parts: either "W:/path" or "W:EventName"
+        2 => {
+            let status = match parse_status(parts[0]) {
+                Some(s) => s,
+                None => return StatusRead::Unrecognized,
+            };
+            // If second part starts with '/', it's a path (current format)
+            if parts[1].starts_with('/') {
+                StatusRead::Parsed {
+                    status,
+                    event_name: None,
+                    cwd: Some(parts[1].to_string()),
+                }
+            } else {
+                // Otherwise it's an event name without path
+                StatusRead::Parsed {
+                    status,
+                    event_name: Some(parts[1].to_string()),
+                    cwd: None,
+                }
+            }
+        }
+        // Three parts: "W:EventName:/path" or "W:/path:with:colons"
+        3 => {
+            let status = match parse_status(parts[0]) {
+                Some(s) => s,
+                None => return StatusRead::Unrecognized,
+            };
+            // If third part starts with '/', second is event name
+            if parts[2].starts_with('/') {
+                StatusRead::Parsed {
+                    status,
+                    event_name: Some(parts[1].to_string()),
+                    cwd: Some(parts[2].to_string()),
+                }
+            } else if parts[1].starts_with('/') {
+                // Path with colons: "W:/path:rest" - rejoin as path
+                StatusRead::Parsed {
+                    status,
+                    event_name: None,
+                    cwd: Some(format!("{}:{}", parts[1], parts[2])),
+                }
+            } else {
+                // Event name with non-absolute path: "W:EventName:relative/path"
+                StatusRead::Parsed {
+                    status,
+                    event_name: Some(parts[1].to_string()),
+                    cwd: Some(parts[2].to_string()),
+                }
+            }
+        }
+        _ => StatusRead::Unrecognized,
+    }
 }
 
 /// Deletes the status file for an agent
@@ -354,11 +411,12 @@ impl AgentMonitorPlugin {
                 let parsed = parse_status_content(&output);
                 if let StatusRead::Parsed {
                     status: new_status,
+                    event_name: new_event,
                     cwd: new_cwd,
                 } = parsed
                 {
                     // Use update_agent_status for hysteresis support
-                    self.update_agent_status(agent_id, new_status, new_cwd);
+                    self.update_agent_status(agent_id, new_status, new_event, new_cwd);
                 }
             }
         }
@@ -546,7 +604,7 @@ impl AgentMonitorPlugin {
 
     /// Update agent status with hysteresis for Working->Idle transitions
     /// NeedsInput transitions are immediate (no delay)
-    fn update_agent_status(&mut self, agent_id: &str, new_status: AgentStatus, new_cwd: Option<String>) {
+    fn update_agent_status(&mut self, agent_id: &str, new_status: AgentStatus, new_event: Option<String>, new_cwd: Option<String>) {
         if let Some(agent) = self.state.agents.iter_mut().find(|a| a.agent_id == agent_id) {
             let old_status = agent.status;
 
@@ -561,9 +619,12 @@ impl AgentMonitorPlugin {
                     let elapsed = self.state.tick_count.saturating_sub(*last_tick);
                     if elapsed < HYSTERESIS_TICKS {
                         // Keep Working status, don't transition yet
-                        // But still update CWD if provided
+                        // But still update CWD and event if provided
                         if new_cwd.is_some() {
                             agent.cwd = new_cwd;
+                        }
+                        if new_event.is_some() {
+                            agent.last_event = new_event;
                         }
                         return; // Don't change status yet
                     }
@@ -576,11 +637,14 @@ impl AgentMonitorPlugin {
             if new_cwd.is_some() {
                 agent.cwd = new_cwd;
             }
+            if new_event.is_some() {
+                agent.last_event = new_event.clone();
+            }
 
             if status_changed {
                 self.push_debug(&format!(
-                    "Status: {} {:?} -> {:?}",
-                    agent_id, old_status, new_status
+                    "Status: {} {:?} -> {:?} (event: {:?})",
+                    agent_id, old_status, new_status, new_event
                 ));
             }
         }
@@ -589,7 +653,7 @@ impl AgentMonitorPlugin {
     /// Polls status files for all non-terminal agents and updates their status
     fn poll_status_files(&mut self) {
         // Collect updates first to avoid borrow conflicts with update_agent_status
-        let mut status_updates: Vec<(String, AgentStatus, Option<String>)> = Vec::new();
+        let mut status_updates: Vec<(String, AgentStatus, Option<String>, Option<String>)> = Vec::new();
         let mut pending_command_reads = Vec::new();
 
         for agent in &self.state.agents {
@@ -601,8 +665,8 @@ impl AgentMonitorPlugin {
             let read_result = read_agent_status(&agent.agent_id);
 
             match read_result {
-                StatusRead::Parsed { status, cwd } => {
-                    status_updates.push((agent.agent_id.clone(), status, cwd));
+                StatusRead::Parsed { status, event_name, cwd } => {
+                    status_updates.push((agent.agent_id.clone(), status, event_name, cwd));
                 }
                 StatusRead::NotFound => {
                     pending_command_reads.push(agent.agent_id.clone());
@@ -614,8 +678,8 @@ impl AgentMonitorPlugin {
         }
 
         // Apply status updates with hysteresis
-        for (agent_id, new_status, new_cwd) in status_updates {
-            self.update_agent_status(&agent_id, new_status, new_cwd);
+        for (agent_id, new_status, new_event, new_cwd) in status_updates {
+            self.update_agent_status(&agent_id, new_status, new_event, new_cwd);
         }
 
         // Request status via command for agents without files
@@ -679,6 +743,7 @@ impl AgentMonitorPlugin {
             title,
             status: AgentStatus::Idle,
             cwd: None,
+            last_event: None,
             created_tick: self.state.tick_count,
         });
     }
@@ -714,8 +779,9 @@ mod tests {
     #[test]
     fn test_parse_status_content_with_cwd() {
         match parse_status_content("W:/path/to/cwd") {
-            StatusRead::Parsed { status, cwd } => {
+            StatusRead::Parsed { status, event_name, cwd } => {
                 assert_eq!(status, AgentStatus::Working);
+                assert_eq!(event_name, None);
                 assert_eq!(cwd, Some("/path/to/cwd".to_string()));
             }
             _ => panic!("Expected Parsed variant"),
@@ -725,8 +791,9 @@ mod tests {
     #[test]
     fn test_parse_status_content_legacy() {
         match parse_status_content("I") {
-            StatusRead::Parsed { status, cwd } => {
+            StatusRead::Parsed { status, event_name, cwd } => {
                 assert_eq!(status, AgentStatus::Idle);
+                assert_eq!(event_name, None);
                 assert_eq!(cwd, None);
             }
             _ => panic!("Expected Parsed variant"),
@@ -736,8 +803,9 @@ mod tests {
     #[test]
     fn test_parse_status_content_needs_input() {
         match parse_status_content("?:/some/path") {
-            StatusRead::Parsed { status, cwd } => {
+            StatusRead::Parsed { status, event_name, cwd } => {
                 assert_eq!(status, AgentStatus::NeedsInput);
+                assert_eq!(event_name, None);
                 assert_eq!(cwd, Some("/some/path".to_string()));
             }
             _ => panic!("Expected Parsed variant"),
@@ -748,5 +816,93 @@ mod tests {
     fn test_parse_status_content_invalid() {
         assert!(matches!(parse_status_content("X"), StatusRead::Unrecognized));
         assert!(matches!(parse_status_content("invalid"), StatusRead::Unrecognized));
+    }
+
+    // New format tests: W:EventName:/path
+    #[test]
+    fn test_parse_status_content_with_event_and_cwd() {
+        match parse_status_content("W:PreToolUse:/home/user/project") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Working);
+                assert_eq!(event_name, Some("PreToolUse".to_string()));
+                assert_eq!(cwd, Some("/home/user/project".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_with_event_no_cwd() {
+        match parse_status_content("I:PostToolUse") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Idle);
+                assert_eq!(event_name, Some("PostToolUse".to_string()));
+                assert_eq!(cwd, None);
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_notification_event() {
+        match parse_status_content("?:Notification:/tmp/work") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::NeedsInput);
+                assert_eq!(event_name, Some("Notification".to_string()));
+                assert_eq!(cwd, Some("/tmp/work".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_stop_event() {
+        match parse_status_content("I:Stop:/var/log") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Idle);
+                assert_eq!(event_name, Some("Stop".to_string()));
+                assert_eq!(cwd, Some("/var/log".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_unknown_event() {
+        // Forward compatibility: accept unknown event names
+        match parse_status_content("W:FutureHook:/path") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Working);
+                assert_eq!(event_name, Some("FutureHook".to_string()));
+                assert_eq!(cwd, Some("/path".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_path_with_colons() {
+        // Path with colons (backward compatible format): W:/path:with:colons
+        match parse_status_content("W:/path:with:colons") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Working);
+                assert_eq!(event_name, None);
+                // splitn(3) preserves first colon in path, rest gets truncated
+                assert_eq!(cwd, Some("/path:with:colons".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_whitespace_trimmed() {
+        match parse_status_content("  W:PreToolUse:/path  \n") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Working);
+                assert_eq!(event_name, Some("PreToolUse".to_string()));
+                assert_eq!(cwd, Some("/path".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
     }
 }
