@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::Read;
 use std::path::PathBuf;
 use uuid::Uuid;
 use zellij_tile::prelude::*;
@@ -18,6 +19,7 @@ pub enum AgentStatus {
     Idle,        // Waiting for user input
     Working,     // Tool in progress
     NeedsInput,  // Waiting for approval
+    Unread,      // Completed work, not yet viewed
     Completed,   // Exited with code 0
     Failed,      // Exited with non-zero code
 }
@@ -55,6 +57,9 @@ pub struct State {
     pub debug_ring: VecDeque<DebugEntry>,
     pub tick_count: u64,
     pub last_working_tick: HashMap<String, u64>,
+    // Focus tracking for Unread -> Idle transitions
+    pub floating_panes_visible: bool,
+    pub focused_pane_id: Option<u32>,
 }
 
 // Spinner frames for working indicator
@@ -83,14 +88,62 @@ const SLOW_POLL_SECS: f64 = 0.5;
 const DEBUG_ENTRIES_DISPLAY: usize = 5;
 const RENDER_PADDING_OFFSET: usize = 10;
 
+// Maximum status file size to read (4KB should be plenty for status content)
+// This prevents DoS from oversized files in world-writable temp directories
+const MAX_STATUS_FILE_SIZE: u64 = 4096;
+
 /// Check if a pane title contains a Braille spinner character
 fn title_has_spinner(title: &str) -> bool {
     title.chars().any(|c| BRAILLE_SPINNERS.contains(&c))
 }
 
-// Status file directory
-const STATUS_DIR: &str = "/tmp/agent-monitor";
-const STATUS_DIR_FALLBACK: &str = "/private/tmp/agent-monitor";
+/// Returns the status directory path using a secure fallback chain.
+/// Prefers user-specific directories to mitigate /tmp symlink attacks.
+fn status_dir() -> PathBuf {
+    // 1. Try XDG_RUNTIME_DIR (per-user, auto-cleaned on logout)
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("agent-monitor");
+    }
+
+    // 2. Try TMPDIR (user-specific on macOS: /var/folders/...)
+    if let Ok(tmpdir) = std::env::var("TMPDIR") {
+        return PathBuf::from(tmpdir).join("agent-monitor");
+    }
+
+    // 3. Fall back to user-specific /tmp directory
+    if let Ok(user) = std::env::var("USER") {
+        return PathBuf::from(format!("/tmp/agent-monitor-{}", user));
+    }
+
+    // 4. Last resort: shared /tmp (least secure)
+    PathBuf::from("/tmp/agent-monitor")
+}
+
+/// Ensures the status directory exists with secure permissions (0700).
+/// Returns true if directory exists or was created successfully.
+fn ensure_status_dir() -> bool {
+    let dir = status_dir();
+
+    // Check if directory already exists
+    if dir.is_dir() {
+        return true;
+    }
+
+    // Create directory with restrictive permissions
+    // Note: WASI may have limitations on permission setting
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => {
+            // Try to set permissions to 0700 (owner read/write/execute only)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
 
 /// Validate agent_id to prevent command injection and path traversal.
 /// Returns true if the agent_id is safe to use in file paths and shell commands.
@@ -103,12 +156,9 @@ fn is_valid_agent_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-/// Returns (primary_path, fallback_path) for status file
-fn status_file_paths(agent_id: &str) -> (String, String) {
-    (
-        format!("{}/{}.status", STATUS_DIR, agent_id),
-        format!("{}/{}.status", STATUS_DIR_FALLBACK, agent_id),
-    )
+/// Returns the status file path for an agent
+fn status_file_path(agent_id: &str) -> PathBuf {
+    status_dir().join(format!("{}.status", agent_id))
 }
 
 #[derive(Debug)]
@@ -122,26 +172,40 @@ enum StatusRead {
     NotFound,
 }
 
-/// Reads agent status from file. Returns (status, cwd) if file exists.
+/// Reads agent status from file with bounded size to prevent DoS.
 /// Format: "W:/path/to/cwd" or legacy "W" (without CWD)
+/// Returns NotFound if file doesn't exist or is too large.
 fn read_agent_status(agent_id: &str) -> StatusRead {
     // Validate agent_id to prevent path traversal attacks
     if !is_valid_agent_id(agent_id) {
         return StatusRead::NotFound;
     }
 
-    let (primary_path, fallback_path) = status_file_paths(agent_id);
+    let status_path = status_file_path(agent_id);
 
-    match std::fs::read_to_string(&primary_path)
-        .or_else(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                std::fs::read_to_string(&fallback_path)
-            } else {
-                Err(e)
-            }
-        })
-    {
-        Ok(content) => parse_status_content(&content),
+    // Open file and check size before reading to prevent DoS
+    let file = match std::fs::File::open(&status_path) {
+        Ok(f) => f,
+        Err(_) => return StatusRead::NotFound,
+    };
+
+    // Check file size via metadata - skip oversized files
+    if let Ok(metadata) = file.metadata() {
+        if metadata.len() > MAX_STATUS_FILE_SIZE {
+            // File too large - treat as unrecognized to prevent memory exhaustion
+            return StatusRead::Unrecognized;
+        }
+    }
+
+    // Read up to MAX_STATUS_FILE_SIZE bytes
+    let mut buffer = Vec::with_capacity(MAX_STATUS_FILE_SIZE as usize);
+    let mut handle = file.take(MAX_STATUS_FILE_SIZE);
+
+    match handle.read_to_end(&mut buffer) {
+        Ok(_) => {
+            let content = String::from_utf8_lossy(&buffer);
+            parse_status_content(&content)
+        }
         Err(_) => StatusRead::NotFound,
     }
 }
@@ -149,6 +213,14 @@ fn read_agent_status(agent_id: &str) -> StatusRead {
 // Maximum lengths for parsed fields to prevent DoS from malicious input
 const MAX_EVENT_NAME_LEN: usize = 64;
 const MAX_CWD_LEN: usize = 4096;
+
+/// Sanitize a status field by stripping control characters and ANSI escapes.
+/// This prevents UI spoofing from malicious status files.
+fn sanitize_status_field(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .collect()
+}
 
 fn parse_status_content(content: &str) -> StatusRead {
     let content = content.trim();
@@ -159,22 +231,25 @@ fn parse_status_content(content: &str) -> StatusRead {
         Some("W") => AgentStatus::Working,
         Some("I") => AgentStatus::Idle,
         Some("?") => AgentStatus::NeedsInput,
+        Some("U") => AgentStatus::Unread,
         _ => return StatusRead::Unrecognized,
     };
 
-    // Helper to validate and convert event name
+    // Helper to validate, sanitize, and convert event name
     let to_event = |s: &str| {
-        if s.len() <= MAX_EVENT_NAME_LEN {
-            Some(s.to_string())
+        let sanitized = sanitize_status_field(s);
+        if sanitized.len() <= MAX_EVENT_NAME_LEN {
+            Some(sanitized)
         } else {
             None // Reject overly long event names
         }
     };
 
-    // Helper to validate and convert cwd path
+    // Helper to validate, sanitize, and convert cwd path
     let to_cwd = |s: &str| {
-        if s.len() <= MAX_CWD_LEN {
-            Some(s.to_string())
+        let sanitized = sanitize_status_field(s);
+        if sanitized.len() <= MAX_CWD_LEN {
+            Some(sanitized)
         } else {
             None // Reject overly long paths
         }
@@ -241,9 +316,8 @@ fn delete_status_file(agent_id: &str) {
         return;
     }
 
-    let (primary_path, fallback_path) = status_file_paths(agent_id);
-    let _ = std::fs::remove_file(primary_path);
-    let _ = std::fs::remove_file(fallback_path);
+    let status_path = status_file_path(agent_id);
+    let _ = std::fs::remove_file(status_path);
 }
 
 // =============================================================================
@@ -266,16 +340,22 @@ impl ZellijPlugin for AgentMonitorPlugin {
             EventType::CommandPaneOpened,
             EventType::CommandPaneExited,
             EventType::PaneClosed,
-            EventType::PaneUpdate, // For spinner detection fallback
+            EventType::PaneUpdate,  // For spinner detection fallback + focus tracking
+            EventType::TabUpdate,   // For tracking floating pane visibility
         ]);
 
+        // Request minimum permissions required for plugin functionality:
+        // - ReadApplicationState: Required for PaneUpdate/TabUpdate events (focus tracking, spinner detection)
+        // - ChangeApplicationState: Required for show_pane_with_id, hide_self, close_terminal_pane
+        // - RunCommands: Required for run_command_with_env_variables_and_cwd (status file writes, fallback reads)
+        // - OpenTerminalsOrPlugins: Required for open_command_pane_floating (spawning agent panes)
+        // Note: OpenFiles not needed - std::fs works without it in WASI plugins
+        // Note: FullHdAccess removed - was not required for any plugin functionality
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
-            PermissionType::OpenFiles,
             PermissionType::RunCommands,
             PermissionType::OpenTerminalsOrPlugins,
-            PermissionType::FullHdAccess,
         ]);
 
         self.push_debug("load: plugin initialized");
@@ -295,6 +375,7 @@ impl ZellijPlugin for AgentMonitorPlugin {
             Event::PaneClosed(pane_id) => self.handle_pane_closed(pane_id),
             Event::Timer(elapsed) => self.handle_timer(elapsed),
             Event::PaneUpdate(manifest) => self.handle_pane_update(manifest),
+            Event::TabUpdate(tabs) => self.handle_tab_update(tabs),
             Event::Key(key) => self.handle_key(key),
             _ => false,
         }
@@ -319,6 +400,7 @@ impl ZellijPlugin for AgentMonitorPlugin {
                         format!("[{}]", spinner)
                     }
                     AgentStatus::NeedsInput => "[?]".to_string(),
+                    AgentStatus::Unread => "[*]".to_string(),
                     AgentStatus::Completed => "[v]".to_string(),
                     AgentStatus::Failed => "[X]".to_string(),
                 };
@@ -415,6 +497,10 @@ impl AgentMonitorPlugin {
     ) -> bool {
         if context.get("kind").map(|s| s.as_str()) == Some("status_read") {
             if let Some(agent_id) = context.get("agent_id") {
+                // Skip oversized output as a safety check (should be bounded by head -c)
+                if stdout.len() > MAX_STATUS_FILE_SIZE as usize {
+                    return true;
+                }
                 let output = String::from_utf8_lossy(&stdout);
                 let parsed = parse_status_content(&output);
                 if let StatusRead::Parsed {
@@ -474,45 +560,66 @@ impl AgentMonitorPlugin {
             self.push_debug("timer: tick");
         }
 
-        // Clean up orphaned agents (no pane_id after timeout)
+        // Single-pass consolidation: collect orphan indices, has_working, needs_input
+        // This reduces O(4n) to O(2n) per tick (one scan here + one in poll_status_files)
         let tick = self.state.tick_count;
-        self.state.agents.retain(|a| {
-            if a.pane_id.is_none() && tick.saturating_sub(a.created_tick) > ORPHAN_TIMEOUT_TICKS {
-                delete_status_file(&a.agent_id);
-                return false;
-            }
-            true
-        });
+        let mut has_working = false;
+        let mut needs_input = false;
+        let mut orphan_indices: Vec<usize> = Vec::new();
 
-        // Poll status files for all active agents
+        for (i, agent) in self.state.agents.iter().enumerate() {
+            // Check orphan condition: no pane_id after timeout
+            if agent.pane_id.is_none()
+                && tick.saturating_sub(agent.created_tick) > ORPHAN_TIMEOUT_TICKS
+            {
+                orphan_indices.push(i);
+            }
+
+            // Check status flags for adaptive polling and re-render decision
+            match agent.status {
+                AgentStatus::Working => has_working = true,
+                AgentStatus::NeedsInput => needs_input = true,
+                _ => {}
+            }
+        }
+
+        // Remove orphans in reverse order to preserve indices
+        for i in orphan_indices.into_iter().rev() {
+            let agent = self.state.agents.remove(i);
+            self.state.last_working_tick.remove(&agent.agent_id);
+            delete_status_file(&agent.agent_id);
+        }
+
+        // Poll status files for all active agents (separate pass with file I/O)
         self.poll_status_files();
 
         // Adaptive polling: fast when working, slow when all idle
-        let has_working = self
-            .state
-            .agents
-            .iter()
-            .any(|a| a.status == AgentStatus::Working);
-
         set_timeout(if has_working { FAST_POLL_SECS } else { SLOW_POLL_SECS });
 
         // Re-render if there's a working agent (spinner) or needs input
-        has_working
-            || self
-                .state
-                .agents
-                .iter()
-                .any(|a| a.status == AgentStatus::NeedsInput)
+        has_working || needs_input
     }
 
-    /// Handle pane update event (spinner detection fallback)
+    /// Handle pane update event (spinner detection fallback + focus tracking)
     fn handle_pane_update(&mut self, manifest: PaneManifest) -> bool {
         // Spinner detection fallback: detect activity via pane title spinners
         // Collect agents to update to avoid borrow conflicts
         let mut spinner_detected: Vec<String> = Vec::new();
 
+        // Track focused pane for Unread -> Idle transitions
         for (_tab_idx, panes) in &manifest.panes {
             for pane in panes {
+                // Track which pane is focused
+                if pane.is_focused {
+                    let old_focused = self.state.focused_pane_id;
+                    self.state.focused_pane_id = Some(pane.id);
+
+                    // If focus changed, check for Unread transitions
+                    if old_focused != Some(pane.id) {
+                        self.check_unread_transitions();
+                    }
+                }
+
                 // Find matching agent by pane_id
                 if let Some(agent) = self.state.agents.iter()
                     .find(|a| a.pane_id == Some(pane.id))
@@ -539,6 +646,24 @@ impl AgentMonitorPlugin {
                 );
             }
             self.push_debug(&format!("Fallback: spinner detected for {}", agent_id));
+        }
+        true
+    }
+
+    /// Handle tab update event (track floating pane visibility)
+    fn handle_tab_update(&mut self, tabs: Vec<TabInfo>) -> bool {
+        // Find active tab and track floating pane visibility
+        for tab in &tabs {
+            if tab.active {
+                let was_visible = self.state.floating_panes_visible;
+                self.state.floating_panes_visible = tab.are_floating_panes_visible;
+
+                // If floating panes just became visible, check for Unread transitions
+                if !was_visible && tab.are_floating_panes_visible {
+                    self.check_unread_transitions();
+                }
+                break;
+            }
         }
         true
     }
@@ -660,6 +785,59 @@ impl AgentMonitorPlugin {
         }
     }
 
+    /// Check if any Unread agents should transition to Idle because their pane is now focused
+    fn check_unread_transitions(&mut self) {
+        let focused_id = self.state.focused_pane_id;
+
+        // Collect agents that need transition (to avoid borrow conflicts)
+        let mut agents_to_transition: Vec<(String, Option<String>)> = Vec::new();
+
+        for agent in &self.state.agents {
+            if agent.status == AgentStatus::Unread && agent.pane_id == focused_id {
+                agents_to_transition.push((agent.agent_id.clone(), agent.cwd.clone()));
+            }
+        }
+
+        // Apply transitions
+        for (agent_id, cwd) in agents_to_transition {
+            if let Some(agent) = self.state.agents.iter_mut().find(|a| a.agent_id == agent_id) {
+                agent.status = AgentStatus::Idle;
+                self.push_debug(&format!("Unread -> Idle: {} (pane focused)", agent_id));
+            }
+            // Write I: to status file so the state persists
+            self.write_status_file(&agent_id, "I", cwd.as_deref());
+        }
+    }
+
+    /// Write status to the agent's status file
+    fn write_status_file(&self, agent_id: &str, status: &str, cwd: Option<&str>) {
+        if !is_valid_agent_id(agent_id) {
+            return;
+        }
+
+        // Ensure status directory exists with secure permissions
+        ensure_status_dir();
+
+        let content = match cwd {
+            Some(path) => format!("{}:{}", status, path),
+            None => status.to_string(),
+        };
+
+        let status_path = status_file_path(agent_id);
+        let status_path_str = status_path.to_string_lossy().to_string();
+
+        let mut env = BTreeMap::new();
+        env.insert("STATUS_PATH".to_string(), status_path_str);
+        env.insert("STATUS_CONTENT".to_string(), content);
+
+        run_command_with_env_variables_and_cwd(
+            &["/bin/sh", "-c", "printf '%s' \"$STATUS_CONTENT\" > \"$STATUS_PATH\""],
+            env,
+            PathBuf::from("."),
+            BTreeMap::new(),
+        );
+    }
+
     /// Polls status files for all non-terminal agents and updates their status
     fn poll_status_files(&mut self) {
         // Collect updates first to avoid borrow conflicts with update_agent_status
@@ -704,18 +882,20 @@ impl AgentMonitorPlugin {
             return;
         }
 
-        let (primary_path, fallback_path) = status_file_paths(agent_id);
+        let status_path = status_file_path(agent_id);
+        let status_path_str = status_path.to_string_lossy().to_string();
 
         let mut env = BTreeMap::new();
-        env.insert("PRIMARY_PATH".to_string(), primary_path);
-        env.insert("FALLBACK_PATH".to_string(), fallback_path);
+        env.insert("STATUS_PATH".to_string(), status_path_str);
+        env.insert("MAX_SIZE".to_string(), MAX_STATUS_FILE_SIZE.to_string());
 
         let mut context = BTreeMap::new();
         context.insert("kind".to_string(), "status_read".to_string());
         context.insert("agent_id".to_string(), agent_id.to_string());
 
+        // Use head -c to bound output size, preventing DoS from oversized files
         run_command_with_env_variables_and_cwd(
-            &["/bin/sh", "-c", "cat \"$FALLBACK_PATH\" 2>/dev/null || cat \"$PRIMARY_PATH\" 2>/dev/null"],
+            &["/bin/sh", "-c", "head -c \"$MAX_SIZE\" \"$STATUS_PATH\" 2>/dev/null"],
             env,
             PathBuf::from("."),
             context,
@@ -911,6 +1091,163 @@ mod tests {
                 assert_eq!(status, AgentStatus::Working);
                 assert_eq!(event_name, Some("PreToolUse".to_string()));
                 assert_eq!(cwd, Some("/path".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    // Unread status tests
+    #[test]
+    fn test_parse_status_content_unread_with_cwd() {
+        match parse_status_content("U:/home/user/project") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Unread);
+                assert_eq!(event_name, None);
+                assert_eq!(cwd, Some("/home/user/project".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_unread_with_event() {
+        match parse_status_content("U:Stop:/var/log") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Unread);
+                assert_eq!(event_name, Some("Stop".to_string()));
+                assert_eq!(cwd, Some("/var/log".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_unread_legacy() {
+        match parse_status_content("U") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Unread);
+                assert_eq!(event_name, None);
+                assert_eq!(cwd, None);
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    // Status directory tests
+    #[test]
+    fn test_status_dir_returns_path() {
+        // status_dir should always return a valid PathBuf
+        let dir = status_dir();
+        assert!(!dir.as_os_str().is_empty());
+        // Should end with agent-monitor or agent-monitor-{user}
+        let dir_str = dir.to_string_lossy();
+        assert!(dir_str.contains("agent-monitor"));
+    }
+
+    #[test]
+    fn test_status_file_path_format() {
+        let path = status_file_path("abc12345");
+        let path_str = path.to_string_lossy();
+        // Should contain the agent id and .status extension
+        assert!(path_str.contains("abc12345"));
+        assert!(path_str.ends_with(".status"));
+    }
+
+    #[test]
+    fn test_status_file_path_uses_status_dir() {
+        let dir = status_dir();
+        let path = status_file_path("test1234");
+        // The status file should be inside the status directory
+        assert!(path.starts_with(&dir));
+    }
+
+    // Bounded read tests
+    #[test]
+    fn test_max_status_file_size_constant() {
+        // Verify the constant is a reasonable value (4KB)
+        assert_eq!(MAX_STATUS_FILE_SIZE, 4096);
+        // Must be at least as large as MAX_CWD_LEN to accommodate full paths
+        assert!(MAX_STATUS_FILE_SIZE >= MAX_CWD_LEN as u64);
+    }
+
+    #[test]
+    fn test_parse_status_content_rejects_oversized_event() {
+        // Event name longer than MAX_EVENT_NAME_LEN should be rejected
+        let long_event = "A".repeat(MAX_EVENT_NAME_LEN + 1);
+        let content = format!("W:{}:/path", long_event);
+        match parse_status_content(&content) {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Working);
+                assert_eq!(event_name, None); // Rejected due to length
+                assert_eq!(cwd, Some("/path".to_string()));
+            }
+            _ => panic!("Expected Parsed variant with rejected event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_accepts_max_length_event() {
+        // Event name exactly at MAX_EVENT_NAME_LEN should be accepted
+        let max_event = "A".repeat(MAX_EVENT_NAME_LEN);
+        let content = format!("W:{}:/path", max_event);
+        match parse_status_content(&content) {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Working);
+                assert_eq!(event_name, Some(max_event));
+                assert_eq!(cwd, Some("/path".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    // Sanitization tests
+    #[test]
+    fn test_sanitize_status_field_strips_control_chars() {
+        // Test various control characters are stripped
+        assert_eq!(sanitize_status_field("hello\x00world"), "helloworld");
+        assert_eq!(sanitize_status_field("test\x1b[31mred\x1b[0m"), "test[31mred[0m");
+        assert_eq!(sanitize_status_field("line\r\nbreak"), "linebreak");
+        assert_eq!(sanitize_status_field("tab\there"), "tabhere");
+    }
+
+    #[test]
+    fn test_sanitize_status_field_preserves_space() {
+        // Space should be preserved (it's technically a control char but useful)
+        assert_eq!(sanitize_status_field("hello world"), "hello world");
+        assert_eq!(sanitize_status_field("  spaces  "), "  spaces  ");
+    }
+
+    #[test]
+    fn test_sanitize_status_field_preserves_normal_text() {
+        // Normal text should pass through unchanged
+        assert_eq!(sanitize_status_field("PreToolUse"), "PreToolUse");
+        assert_eq!(sanitize_status_field("/home/user/project"), "/home/user/project");
+        assert_eq!(sanitize_status_field("path-with-dashes_and_underscores"), "path-with-dashes_and_underscores");
+    }
+
+    #[test]
+    fn test_parse_status_content_sanitizes_event_name() {
+        // Control characters in event name should be stripped
+        match parse_status_content("W:Evil\x1b[31mEvent:/path") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Working);
+                // ANSI escape sequence should have control char stripped
+                assert_eq!(event_name, Some("Evil[31mEvent".to_string()));
+                assert_eq!(cwd, Some("/path".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_sanitizes_cwd() {
+        // Control characters in cwd should be stripped
+        match parse_status_content("I:/home/user\x00/project") {
+            StatusRead::Parsed { status, event_name, cwd } => {
+                assert_eq!(status, AgentStatus::Idle);
+                assert_eq!(event_name, None);
+                // Null byte should be stripped
+                assert_eq!(cwd, Some("/home/user/project".to_string()));
             }
             _ => panic!("Expected Parsed variant"),
         }
