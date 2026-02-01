@@ -92,6 +92,10 @@ const RENDER_PADDING_OFFSET: usize = 10;
 // This prevents DoS from oversized files in world-writable temp directories
 const MAX_STATUS_FILE_SIZE: u64 = 4096;
 
+// Spinner absence threshold: ticks without spinner before Working → Idle
+// ~1 second at 100ms tick rate, balances responsiveness vs. flicker
+const SPINNER_ABSENCE_TICKS: u64 = 10;
+
 /// Check if a pane title contains a Braille spinner character
 fn title_has_spinner(title: &str) -> bool {
     title.chars().any(|c| BRAILLE_SPINNERS.contains(&c))
@@ -605,6 +609,8 @@ impl AgentMonitorPlugin {
         // Spinner detection fallback: detect activity via pane title spinners
         // Collect agents to update to avoid borrow conflicts
         let mut spinner_detected: Vec<String> = Vec::new();
+        let mut spinner_cleared: Vec<String> = Vec::new();
+        let current_tick = self.state.tick_count;
 
         // Track focused pane for Unread -> Idle transitions
         for (_tab_idx, panes) in &manifest.panes {
@@ -626,9 +632,20 @@ impl AgentMonitorPlugin {
                 {
                     let spinner_active = title_has_spinner(&pane.title);
 
-                    // Only use spinner as fallback when hook says Idle
+                    // Idle + spinner → Working (existing behavior)
                     if agent.status == AgentStatus::Idle && spinner_active {
                         spinner_detected.push(agent.agent_id.clone());
+                    }
+
+                    // Working + no spinner → Idle (new: detect interrupt/completion)
+                    // Use hysteresis to avoid flickering on brief spinner absences
+                    if agent.status == AgentStatus::Working && !spinner_active {
+                        if let Some(&last_tick) = self.state.last_working_tick.get(&agent.agent_id) {
+                            let ticks_since_working = current_tick.saturating_sub(last_tick);
+                            if ticks_since_working >= SPINNER_ABSENCE_TICKS {
+                                spinner_cleared.push(agent.agent_id.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -647,6 +664,17 @@ impl AgentMonitorPlugin {
             }
             self.push_debug(&format!("Fallback: spinner detected for {}", agent_id));
         }
+
+        // Apply spinner-cleared Idle status (interrupt/completion detection)
+        for agent_id in spinner_cleared {
+            if let Some(agent) = self.state.agents.iter_mut()
+                .find(|a| a.agent_id == agent_id)
+            {
+                agent.status = AgentStatus::Idle;
+            }
+            self.push_debug(&format!("Fallback: spinner cleared, {} → Idle", agent_id));
+        }
+
         true
     }
 
