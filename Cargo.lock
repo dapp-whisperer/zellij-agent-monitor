@@ -3431,6 +3431,7 @@ dependencies = [
 name = "zellij-agent-monitor"
 version = "0.1.0"
 dependencies = [
+ "uuid",
  "zellij-tile",
 ]
 

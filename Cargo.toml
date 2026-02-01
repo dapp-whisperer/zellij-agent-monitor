@@ -7,6 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
+uuid = { version = "1.20.0", features = ["v4"] }
 zellij-tile = "0.43"
 
 [profile.release]

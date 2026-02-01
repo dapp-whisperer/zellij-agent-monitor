@@ -13,7 +13,7 @@ pub extern "C" fn _start() {
 // Data Structures
 // =============================================================================
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AgentStatus {
     Idle,        // Waiting for user input
     Working,     // Tool in progress
@@ -35,6 +35,7 @@ pub struct Agent {
     pub title: String,
     pub status: AgentStatus,
     pub cwd: Option<String>,
+    pub created_tick: u64,       // For orphan cleanup timeout
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +50,6 @@ pub struct State {
     pub selected: usize,
     pub agent_counter: u32,
     pub spinner_frame: usize,
-    pub debug_log_path: Option<String>,
     // Fields for debug storage + activity fallback
     pub debug_ring: VecDeque<DebugEntry>,
     pub tick_count: u64,
@@ -71,6 +71,17 @@ const DEBUG_RING_SIZE: usize = 100;
 // Hysteresis: ~2s at 100ms timer rate (20 ticks)
 const HYSTERESIS_TICKS: u64 = 20;
 
+// Orphan cleanup: 10s at 100ms timer rate
+const ORPHAN_TIMEOUT_TICKS: u64 = 100;
+
+// Magic number constants
+const MAX_AGENT_ID_LEN: usize = 16;
+const INITIAL_TIMEOUT_SECS: f64 = 1.0;
+const FAST_POLL_SECS: f64 = 0.1;
+const SLOW_POLL_SECS: f64 = 0.5;
+const DEBUG_ENTRIES_DISPLAY: usize = 5;
+const RENDER_PADDING_OFFSET: usize = 10;
+
 /// Check if a pane title contains a Braille spinner character
 fn title_has_spinner(title: &str) -> bool {
     title.chars().any(|c| BRAILLE_SPINNERS.contains(&c))
@@ -83,7 +94,7 @@ const STATUS_DIR_FALLBACK: &str = "/private/tmp/agent-monitor";
 /// Validate agent_id to prevent command injection and path traversal.
 /// Returns true if the agent_id is safe to use in file paths and shell commands.
 fn is_valid_agent_id(id: &str) -> bool {
-    id.len() <= 16
+    id.len() <= MAX_AGENT_ID_LEN
         && !id.is_empty()
         && !id.contains('/')
         && !id.contains('\\')
@@ -202,8 +213,8 @@ impl ZellijPlugin for AgentMonitorPlugin {
             PermissionType::FullHdAccess,
         ]);
 
-        self.append_debug_log("load: plugin initialized");
-        set_timeout(1.0);
+        self.push_debug("load: plugin initialized");
+        set_timeout(INITIAL_TIMEOUT_SECS);
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -236,15 +247,15 @@ impl ZellijPlugin for AgentMonitorPlugin {
         } else {
             for (i, agent) in self.state.agents.iter().enumerate() {
                 let marker = if i == self.state.selected { ">" } else { " " };
-                let (status_str, _color_idx) = match agent.status {
-                    AgentStatus::Idle => ("[.]".to_string(), 0),         // cyan
+                let status_str = match agent.status {
+                    AgentStatus::Idle => "[.]".to_string(),
                     AgentStatus::Working => {
                         let spinner = SPINNER[self.state.spinner_frame];
-                        (format!("[{}]", spinner), 2)                    // yellow
+                        format!("[{}]", spinner)
                     }
-                    AgentStatus::NeedsInput => ("[?]".to_string(), 3),   // orange
-                    AgentStatus::Completed => ("[v]".to_string(), 1),    // green
-                    AgentStatus::Failed => ("[X]".to_string(), 3),       // red
+                    AgentStatus::NeedsInput => "[?]".to_string(),
+                    AgentStatus::Completed => "[v]".to_string(),
+                    AgentStatus::Failed => "[X]".to_string(),
                 };
                 // Format CWD as last 2 path components
                 let cwd_display = agent.cwd.as_ref()
@@ -266,10 +277,10 @@ impl ZellijPlugin for AgentMonitorPlugin {
         let debug_padding = "-".repeat(cols.saturating_sub(debug_header.len()));
         println!("{}{}", debug_header, debug_padding);
 
-        // Show last 5 debug entries (oldest to newest)
-        let entries: Vec<_> = self.state.debug_ring.iter().rev().take(5).collect();
+        // Show last N debug entries (oldest to newest)
+        let entries: Vec<_> = self.state.debug_ring.iter().rev().take(DEBUG_ENTRIES_DISPLAY).collect();
         for entry in entries.into_iter().rev() {
-            let max_len = cols.saturating_sub(10); // [tick] prefix
+            let max_len = cols.saturating_sub(RENDER_PADDING_OFFSET); // [tick] prefix
             let truncated: String = entry.message.chars().take(max_len).collect();
             println!("  [{}] {}", entry.tick, truncated);
         }
@@ -290,7 +301,7 @@ impl ZellijPlugin for AgentMonitorPlugin {
 impl AgentMonitorPlugin {
     /// Handle permission request result event
     fn handle_permission_result(&mut self, _result: PermissionStatus) -> bool {
-        self.append_debug_log("permission: result");
+        self.push_debug("permission: result");
         true
     }
 
@@ -371,9 +382,10 @@ impl AgentMonitorPlugin {
 
             self.state.agents.retain(|a| a.pane_id != Some(id));
 
-            // Clean up status file if it was our agent
-            if let Some(agent_id) = agent_id_to_cleanup {
-                delete_status_file(&agent_id);
+            // Clean up status file and HashMap entry if it was our agent
+            if let Some(ref agent_id) = agent_id_to_cleanup {
+                self.state.last_working_tick.remove(agent_id);
+                delete_status_file(agent_id);
             }
 
             // Adjust selection if needed
@@ -396,6 +408,16 @@ impl AgentMonitorPlugin {
             self.push_debug("timer: tick");
         }
 
+        // Clean up orphaned agents (no pane_id after timeout)
+        let tick = self.state.tick_count;
+        self.state.agents.retain(|a| {
+            if a.pane_id.is_none() && tick.saturating_sub(a.created_tick) > ORPHAN_TIMEOUT_TICKS {
+                delete_status_file(&a.agent_id);
+                return false;
+            }
+            true
+        });
+
         // Poll status files for all active agents
         self.poll_status_files();
 
@@ -406,7 +428,7 @@ impl AgentMonitorPlugin {
             .iter()
             .any(|a| a.status == AgentStatus::Working);
 
-        set_timeout(if has_working { 0.1 } else { 0.5 });
+        set_timeout(if has_working { FAST_POLL_SECS } else { SLOW_POLL_SECS });
 
         // Re-render if there's a working agent (spinner) or needs input
         has_working
@@ -510,7 +532,7 @@ impl AgentMonitorPlugin {
 // =============================================================================
 
 impl AgentMonitorPlugin {
-    /// Push a debug message to both the ring buffer and host filesystem
+    /// Push a debug message to the in-memory ring buffer (visible in UI footer)
     fn push_debug(&mut self, msg: &str) {
         // Add to ring buffer with FIFO eviction
         if self.state.debug_ring.len() >= DEBUG_RING_SIZE {
@@ -520,44 +542,13 @@ impl AgentMonitorPlugin {
             tick: self.state.tick_count,
             message: msg.to_string(),
         });
-
-        // Also write to host filesystem (bypasses WASI)
-        self.write_debug_to_host(msg);
-    }
-
-    /// Write debug line to host filesystem via run_command (bypasses WASI restrictions)
-    fn write_debug_to_host(&self, line: &str) {
-        let log_path = "/private/tmp/agent-monitor/plugin-logs/plugin-debug.log";
-        let log_dir = "/private/tmp/agent-monitor/plugin-logs";
-        let formatted = format!("[{}] {}", self.state.tick_count, line);
-
-        let mut env = BTreeMap::new();
-        env.insert("LOG_DIR".to_string(), log_dir.to_string());
-        env.insert("LOG_PATH".to_string(), log_path.to_string());
-        env.insert("LOG_LINE".to_string(), formatted);
-
-        run_command_with_env_variables_and_cwd(
-            &[
-                "/bin/sh",
-                "-lc",
-                "mkdir -p \"$LOG_DIR\" && printf '%s\\n' \"$LOG_LINE\" >> \"$LOG_PATH\"",
-            ],
-            env,
-            PathBuf::from("."),
-            BTreeMap::new(),
-        );
-    }
-
-    /// Legacy method - now delegates to push_debug
-    fn append_debug_log(&mut self, line: &str) {
-        self.push_debug(line);
     }
 
     /// Update agent status with hysteresis for Working->Idle transitions
     /// NeedsInput transitions are immediate (no delay)
     fn update_agent_status(&mut self, agent_id: &str, new_status: AgentStatus, new_cwd: Option<String>) {
         if let Some(agent) = self.state.agents.iter_mut().find(|a| a.agent_id == agent_id) {
-            let old_status = agent.status.clone();
+            let old_status = agent.status;
 
             // Track when we were last Working
             if new_status == AgentStatus::Working {
@@ -581,7 +572,7 @@ impl AgentMonitorPlugin {
 
             // NeedsInput and other transitions are immediate
             let status_changed = agent.status != new_status;
-            agent.status = new_status.clone();
+            agent.status = new_status;
             if new_cwd.is_some() {
                 agent.cwd = new_cwd;
             }
@@ -640,19 +631,19 @@ impl AgentMonitorPlugin {
         }
 
         let (primary_path, fallback_path) = status_file_paths(agent_id);
+
+        let mut env = BTreeMap::new();
+        env.insert("PRIMARY_PATH".to_string(), primary_path);
+        env.insert("FALLBACK_PATH".to_string(), fallback_path);
+
         let mut context = BTreeMap::new();
         context.insert("kind".to_string(), "status_read".to_string());
         context.insert("agent_id".to_string(), agent_id.to_string());
-        let command = format!(
-            "cat {} 2>/dev/null || cat {} 2>/dev/null",
-            fallback_path, primary_path
-        );
-        run_command(
-            &[
-                "/bin/sh",
-                "-lc",
-                &command,
-            ],
+
+        run_command_with_env_variables_and_cwd(
+            &["/bin/sh", "-c", "cat \"$FALLBACK_PATH\" 2>/dev/null || cat \"$PRIMARY_PATH\" 2>/dev/null"],
+            env,
+            PathBuf::from("."),
             context,
         );
     }
@@ -688,6 +679,74 @@ impl AgentMonitorPlugin {
             title,
             status: AgentStatus::Idle,
             cwd: None,
+            created_tick: self.state.tick_count,
         });
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_agent_id_valid() {
+        assert!(is_valid_agent_id("abc123"));
+        assert!(is_valid_agent_id("a1b2c3d4"));
+        assert!(is_valid_agent_id("ABCDEF"));
+        assert!(is_valid_agent_id("a-b-c"));
+    }
+
+    #[test]
+    fn test_is_valid_agent_id_invalid() {
+        assert!(!is_valid_agent_id(""));  // empty
+        assert!(!is_valid_agent_id("12345678901234567"));  // > 16 chars
+        assert!(!is_valid_agent_id("abc/def"));  // path separator
+        assert!(!is_valid_agent_id("abc\\def"));  // backslash
+        assert!(!is_valid_agent_id("abc..def"));  // double dot
+        assert!(!is_valid_agent_id("abc def"));  // space
+        assert!(!is_valid_agent_id("abc!def"));  // special char
+    }
+
+    #[test]
+    fn test_parse_status_content_with_cwd() {
+        match parse_status_content("W:/path/to/cwd") {
+            StatusRead::Parsed { status, cwd } => {
+                assert_eq!(status, AgentStatus::Working);
+                assert_eq!(cwd, Some("/path/to/cwd".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_legacy() {
+        match parse_status_content("I") {
+            StatusRead::Parsed { status, cwd } => {
+                assert_eq!(status, AgentStatus::Idle);
+                assert_eq!(cwd, None);
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_needs_input() {
+        match parse_status_content("?:/some/path") {
+            StatusRead::Parsed { status, cwd } => {
+                assert_eq!(status, AgentStatus::NeedsInput);
+                assert_eq!(cwd, Some("/some/path".to_string()));
+            }
+            _ => panic!("Expected Parsed variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_content_invalid() {
+        assert!(matches!(parse_status_content("X"), StatusRead::Unrecognized));
+        assert!(matches!(parse_status_content("invalid"), StatusRead::Unrecognized));
     }
 }
