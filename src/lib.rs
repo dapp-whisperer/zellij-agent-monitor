@@ -146,83 +146,91 @@ fn read_agent_status(agent_id: &str) -> StatusRead {
     }
 }
 
+// Maximum lengths for parsed fields to prevent DoS from malicious input
+const MAX_EVENT_NAME_LEN: usize = 64;
+const MAX_CWD_LEN: usize = 4096;
+
 fn parse_status_content(content: &str) -> StatusRead {
     let content = content.trim();
 
-    let parse_status = |s: &str| match s {
-        "W" => Some(AgentStatus::Working),
-        "I" => Some(AgentStatus::Idle),
-        "?" => Some(AgentStatus::NeedsInput),
-        _ => None,
+    // Parse status character from first part (common to all formats)
+    let mut parts = content.splitn(3, ':');
+    let status = match parts.next() {
+        Some("W") => AgentStatus::Working,
+        Some("I") => AgentStatus::Idle,
+        Some("?") => AgentStatus::NeedsInput,
+        _ => return StatusRead::Unrecognized,
     };
 
-    let parts: Vec<&str> = content.splitn(3, ':').collect();
-
-    match parts.len() {
-        // Legacy format: "W"
-        1 => {
-            let status = match parse_status(parts[0]) {
-                Some(s) => s,
-                None => return StatusRead::Unrecognized,
-            };
-            StatusRead::Parsed {
-                status,
-                event_name: None,
-                cwd: None,
-            }
+    // Helper to validate and convert event name
+    let to_event = |s: &str| {
+        if s.len() <= MAX_EVENT_NAME_LEN {
+            Some(s.to_string())
+        } else {
+            None // Reject overly long event names
         }
-        // Two parts: either "W:/path" or "W:EventName"
-        2 => {
-            let status = match parse_status(parts[0]) {
-                Some(s) => s,
-                None => return StatusRead::Unrecognized,
-            };
-            // If second part starts with '/', it's a path (current format)
-            if parts[1].starts_with('/') {
+    };
+
+    // Helper to validate and convert cwd path
+    let to_cwd = |s: &str| {
+        if s.len() <= MAX_CWD_LEN {
+            Some(s.to_string())
+        } else {
+            None // Reject overly long paths
+        }
+    };
+
+    match (parts.next(), parts.next()) {
+        // Legacy format: "W"
+        (None, _) => StatusRead::Parsed {
+            status,
+            event_name: None,
+            cwd: None,
+        },
+        // Two parts: "W:/path" or "W:EventName"
+        (Some(second), None) => {
+            if second.starts_with('/') {
+                // Current format: path
                 StatusRead::Parsed {
                     status,
                     event_name: None,
-                    cwd: Some(parts[1].to_string()),
+                    cwd: to_cwd(second),
                 }
             } else {
-                // Otherwise it's an event name without path
+                // Event name without path
                 StatusRead::Parsed {
                     status,
-                    event_name: Some(parts[1].to_string()),
+                    event_name: to_event(second),
                     cwd: None,
                 }
             }
         }
         // Three parts: "W:EventName:/path" or "W:/path:with:colons"
-        3 => {
-            let status = match parse_status(parts[0]) {
-                Some(s) => s,
-                None => return StatusRead::Unrecognized,
-            };
-            // If third part starts with '/', second is event name
-            if parts[2].starts_with('/') {
+        (Some(second), Some(third)) => {
+            if third.starts_with('/') {
+                // New format: event name + absolute path
                 StatusRead::Parsed {
                     status,
-                    event_name: Some(parts[1].to_string()),
-                    cwd: Some(parts[2].to_string()),
+                    event_name: to_event(second),
+                    cwd: to_cwd(third),
                 }
-            } else if parts[1].starts_with('/') {
-                // Path with colons: "W:/path:rest" - rejoin as path
+            } else if second.starts_with('/') {
+                // Path with colons: rejoin as path
+                let full_path = format!("{}:{}", second, third);
                 StatusRead::Parsed {
                     status,
                     event_name: None,
-                    cwd: Some(format!("{}:{}", parts[1], parts[2])),
+                    cwd: to_cwd(&full_path),
                 }
             } else {
-                // Event name with non-absolute path: "W:EventName:relative/path"
+                // Event name with non-absolute path
                 StatusRead::Parsed {
                     status,
-                    event_name: Some(parts[1].to_string()),
-                    cwd: Some(parts[2].to_string()),
+                    event_name: to_event(second),
+                    cwd: to_cwd(third),
                 }
             }
         }
-        _ => StatusRead::Unrecognized,
     }
 }
 
@@ -642,10 +650,12 @@ impl AgentMonitorPlugin {
             }
 
             if status_changed {
-                self.push_debug(&format!(
+                let msg = format!(
                     "Status: {} {:?} -> {:?} (event: {:?})",
                     agent_id, old_status, new_status, new_event
-                ));
+                );
+                // Note: push_debug called after agent borrow scope ends
+                self.push_debug(&msg);
             }
         }
     }
