@@ -50,8 +50,7 @@ pub struct State {
     pub agent_counter: u32,
     pub spinner_frame: usize,
     pub debug_log_path: Option<String>,
-    pub debug_last: Option<String>,
-    // New fields for debug storage + activity fallback
+    // Fields for debug storage + activity fallback
     pub debug_ring: VecDeque<DebugEntry>,
     pub tick_count: u64,
     pub last_working_tick: HashMap<String, u64>,
@@ -80,40 +79,45 @@ fn title_has_spinner(title: &str) -> bool {
 // Status file directory
 const STATUS_DIR: &str = "/tmp/agent-monitor";
 const STATUS_DIR_FALLBACK: &str = "/private/tmp/agent-monitor";
-// Legacy debug log paths (kept for reference, now using run_command bypass)
-#[allow(dead_code)]
-const DEBUG_LOG_PATHS: &[&str] = &[
-    "/private/tmp/agent-monitor/plugin-logs/plugin-debug.log",
-    "/private/tmp/agent-monitor/plugin-debug.log",
-    "/tmp/agent-monitor/plugin-logs/plugin-debug.log",
-    "/tmp/agent-monitor/plugin-debug.log",
-    "/private/tmp/plugin-debug.log",
-    "/tmp/plugin-debug.log",
-    "./plugin-debug.log",
-];
+
+/// Validate agent_id to prevent command injection and path traversal.
+/// Returns true if the agent_id is safe to use in file paths and shell commands.
+fn is_valid_agent_id(id: &str) -> bool {
+    id.len() <= 16
+        && !id.is_empty()
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains("..")
+        && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Returns (primary_path, fallback_path) for status file
+fn status_file_paths(agent_id: &str) -> (String, String) {
+    (
+        format!("{}/{}.status", STATUS_DIR, agent_id),
+        format!("{}/{}.status", STATUS_DIR_FALLBACK, agent_id),
+    )
+}
 
 #[derive(Debug)]
 enum StatusRead {
     Parsed {
         status: AgentStatus,
         cwd: Option<String>,
-        #[allow(dead_code)]
-        raw: String,
     },
-    Unrecognized {
-        #[allow(dead_code)]
-        raw: String,
-    },
+    Unrecognized,
     NotFound,
-    #[allow(dead_code)]
-    ReadError(String),
 }
 
 /// Reads agent status from file. Returns (status, cwd) if file exists.
 /// Format: "W:/path/to/cwd" or legacy "W" (without CWD)
 fn read_agent_status(agent_id: &str) -> StatusRead {
-    let primary_path = format!("{}/{}.status", STATUS_DIR, agent_id);
-    let fallback_path = format!("{}/{}.status", STATUS_DIR_FALLBACK, agent_id);
+    // Validate agent_id to prevent path traversal attacks
+    if !is_valid_agent_id(agent_id) {
+        return StatusRead::NotFound;
+    }
+
+    let (primary_path, fallback_path) = status_file_paths(agent_id);
 
     match std::fs::read_to_string(&primary_path)
         .or_else(|e| {
@@ -125,8 +129,7 @@ fn read_agent_status(agent_id: &str) -> StatusRead {
         })
     {
         Ok(content) => parse_status_content(&content),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => StatusRead::NotFound,
-        Err(e) => StatusRead::ReadError(format!("{:?}", e)),
+        Err(_) => StatusRead::NotFound,
     }
 }
 
@@ -138,16 +141,11 @@ fn parse_status_content(content: &str) -> StatusRead {
             "W" => AgentStatus::Working,
             "I" => AgentStatus::Idle,
             "?" => AgentStatus::NeedsInput,
-            _ => {
-                return StatusRead::Unrecognized {
-                    raw: content.to_string(),
-                }
-            }
+            _ => return StatusRead::Unrecognized,
         };
         return StatusRead::Parsed {
             status,
             cwd: Some(cwd.to_string()),
-            raw: content.to_string(),
         };
     }
     // Fallback: legacy format without CWD
@@ -155,23 +153,19 @@ fn parse_status_content(content: &str) -> StatusRead {
         "W" => AgentStatus::Working,
         "I" => AgentStatus::Idle,
         "?" => AgentStatus::NeedsInput,
-        _ => {
-            return StatusRead::Unrecognized {
-                raw: content.to_string(),
-            }
-        }
+        _ => return StatusRead::Unrecognized,
     };
-    StatusRead::Parsed {
-        status,
-        cwd: None,
-        raw: content.to_string(),
-    }
+    StatusRead::Parsed { status, cwd: None }
 }
 
 /// Deletes the status file for an agent
 fn delete_status_file(agent_id: &str) {
-    let primary_path = format!("{}/{}.status", STATUS_DIR, agent_id);
-    let fallback_path = format!("{}/{}.status", STATUS_DIR_FALLBACK, agent_id);
+    // Validate agent_id to prevent path traversal attacks
+    if !is_valid_agent_id(agent_id) {
+        return;
+    }
+
+    let (primary_path, fallback_path) = status_file_paths(agent_id);
     let _ = std::fs::remove_file(primary_path);
     let _ = std::fs::remove_file(fallback_path);
 }
@@ -208,172 +202,31 @@ impl ZellijPlugin for AgentMonitorPlugin {
             PermissionType::FullHdAccess,
         ]);
 
-        self.state.debug_last = Some("debug: load".to_string());
         self.append_debug_log("load: plugin initialized");
         set_timeout(1.0);
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
-            Event::PermissionRequestResult(_) => {
-                self.append_debug_log("permission: result");
-                true
+            Event::PermissionRequestResult(result) => self.handle_permission_result(result),
+            Event::CommandPaneOpened(pane_id, context) => self.handle_pane_opened(pane_id, context),
+            Event::CommandPaneExited(pane_id, exit_code, context) => {
+                self.handle_pane_exited(pane_id, exit_code, context)
             }
-
-            Event::CommandPaneOpened(pane_id, context) => {
-                // Only track panes we spawned (have our marker in context)
-                if context.get("agent_monitor").is_some() {
-                    // Find the pre-registered agent by agent_id and set its pane_id
-                    if let Some(agent_id) = context.get("agent_id") {
-                        if let Some(agent) = self.state.agents.iter_mut().find(|a| &a.agent_id == agent_id) {
-                            agent.pane_id = Some(pane_id);
-                        }
-                    }
-                }
-                true
+            Event::RunCommandResult(exit_code, stdout, stderr, context) => {
+                self.handle_command_result(exit_code, stdout, stderr, context)
             }
-
-            Event::CommandPaneExited(pane_id, exit_code, _context) => {
-                if let Some(agent) = self
-                    .state
-                    .agents
-                    .iter_mut()
-                    .find(|a| a.pane_id == Some(pane_id))
-                {
-                    agent.status = match exit_code {
-                        Some(0) => AgentStatus::Completed,
-                        _ => AgentStatus::Failed,
-                    };
-                }
-                true
-            }
-
-            Event::RunCommandResult(_exit_code, stdout, _stderr, context) => {
-                if context.get("kind").map(|s| s.as_str()) == Some("status_read") {
-                    if let Some(agent_id) = context.get("agent_id") {
-                        let output = String::from_utf8_lossy(&stdout);
-                        let parsed = parse_status_content(&output);
-                        if let StatusRead::Parsed {
-                            status: new_status,
-                            cwd: new_cwd,
-                            raw: _,
-                        } = parsed
-                        {
-                            // Use update_agent_status for hysteresis support
-                            self.update_agent_status(agent_id, new_status, new_cwd);
-                        }
-                    }
-                }
-                true
-            }
-
-            Event::PaneClosed(pane_id) => {
-                if let PaneId::Terminal(id) = pane_id {
-                    let was_selected = self
-                        .state
-                        .agents
-                        .get(self.state.selected)
-                        .map(|a| a.pane_id == Some(id))
-                        .unwrap_or(false);
-
-                    // Find agent_id for cleanup before removing
-                    let agent_id_to_cleanup = self.state.agents.iter()
-                        .find(|a| a.pane_id == Some(id))
-                        .map(|a| a.agent_id.clone());
-
-                    self.state.agents.retain(|a| a.pane_id != Some(id));
-
-                    // Clean up status file if it was our agent
-                    if let Some(agent_id) = agent_id_to_cleanup {
-                        delete_status_file(&agent_id);
-                    }
-
-                    // Adjust selection if needed
-                    if was_selected && !self.state.agents.is_empty() {
-                        self.state.selected = self.state.selected.min(self.state.agents.len() - 1);
-                    }
-                }
-                true
-            }
-
-            Event::Timer(_) => {
-                // Increment tick counter for hysteresis timing
-                self.state.tick_count += 1;
-
-                // Advance spinner
-                self.state.spinner_frame = (self.state.spinner_frame + 1) % SPINNER.len();
-
-                if self.state.spinner_frame == 0 {
-                    self.push_debug("timer: tick");
-                }
-
-                // Poll status files for all active agents
-                self.poll_status_files();
-
-                // Adaptive polling: fast when working, slow when all idle
-                let has_working = self
-                    .state
-                    .agents
-                    .iter()
-                    .any(|a| a.status == AgentStatus::Working);
-
-                set_timeout(if has_working { 0.1 } else { 0.5 });
-
-                // Re-render if there's a working agent (spinner) or needs input
-                has_working
-                    || self
-                        .state
-                        .agents
-                        .iter()
-                        .any(|a| a.status == AgentStatus::NeedsInput)
-            }
-
-            Event::PaneUpdate(manifest) => {
-                // Spinner detection fallback: detect activity via pane title spinners
-                // Collect agents to update to avoid borrow conflicts
-                let mut spinner_detected: Vec<String> = Vec::new();
-
-                for (_tab_idx, panes) in &manifest.panes {
-                    for pane in panes {
-                        // Find matching agent by pane_id
-                        if let Some(agent) = self.state.agents.iter()
-                            .find(|a| a.pane_id == Some(pane.id))
-                        {
-                            let spinner_active = title_has_spinner(&pane.title);
-
-                            // Only use spinner as fallback when hook says Idle
-                            if agent.status == AgentStatus::Idle && spinner_active {
-                                spinner_detected.push(agent.agent_id.clone());
-                            }
-                        }
-                    }
-                }
-
-                // Apply spinner-based Working status
-                for agent_id in spinner_detected {
-                    if let Some(agent) = self.state.agents.iter_mut()
-                        .find(|a| a.agent_id == agent_id)
-                    {
-                        agent.status = AgentStatus::Working;
-                        self.state.last_working_tick.insert(
-                            agent_id.clone(),
-                            self.state.tick_count
-                        );
-                    }
-                    self.push_debug(&format!("Fallback: spinner detected for {}", agent_id));
-                }
-                true
-            }
-
+            Event::PaneClosed(pane_id) => self.handle_pane_closed(pane_id),
+            Event::Timer(elapsed) => self.handle_timer(elapsed),
+            Event::PaneUpdate(manifest) => self.handle_pane_update(manifest),
             Event::Key(key) => self.handle_key(key),
-
             _ => false,
         }
     }
 
     fn render(&mut self, _rows: usize, cols: usize) {
-        let header = format!("─ Agents ({}) ", self.state.agents.len());
-        let padding = "─".repeat(cols.saturating_sub(header.len()));
+        let header = format!("- Agents ({}) ", self.state.agents.len());
+        let padding = "-".repeat(cols.saturating_sub(header.len()));
         println!("{}{}", header, padding);
 
         if self.state.agents.is_empty() {
@@ -382,15 +235,15 @@ impl ZellijPlugin for AgentMonitorPlugin {
             println!("  Press 'n' to spawn a new agent");
         } else {
             for (i, agent) in self.state.agents.iter().enumerate() {
-                let marker = if i == self.state.selected { "▶" } else { " " };
+                let marker = if i == self.state.selected { ">" } else { " " };
                 let (status_str, _color_idx) = match agent.status {
-                    AgentStatus::Idle => ("[·]".to_string(), 0),         // cyan
+                    AgentStatus::Idle => ("[.]".to_string(), 0),         // cyan
                     AgentStatus::Working => {
                         let spinner = SPINNER[self.state.spinner_frame];
                         (format!("[{}]", spinner), 2)                    // yellow
                     }
                     AgentStatus::NeedsInput => ("[?]".to_string(), 3),   // orange
-                    AgentStatus::Completed => ("[✓]".to_string(), 1),    // green
+                    AgentStatus::Completed => ("[v]".to_string(), 1),    // green
                     AgentStatus::Failed => ("[X]".to_string(), 3),       // red
                 };
                 // Format CWD as last 2 path components
@@ -409,8 +262,8 @@ impl ZellijPlugin for AgentMonitorPlugin {
 
         // Debug footer: show last 5 entries from ring buffer
         println!();
-        let debug_header = format!("─ Debug (tick {}) ", self.state.tick_count);
-        let debug_padding = "─".repeat(cols.saturating_sub(debug_header.len()));
+        let debug_header = format!("- Debug (tick {}) ", self.state.tick_count);
+        let debug_padding = "-".repeat(cols.saturating_sub(debug_header.len()));
         println!("{}{}", debug_header, debug_padding);
 
         // Show last 5 debug entries (oldest to newest)
@@ -424,9 +277,231 @@ impl ZellijPlugin for AgentMonitorPlugin {
             println!("  (no debug messages)");
         }
 
-        let footer = "─ n:new  ↵:focus  x:kill  q:hide ";
-        let footer_padding = "─".repeat(cols.saturating_sub(footer.len()));
+        let footer = "- n:new  enter:focus  x:kill  q:hide ";
+        let footer_padding = "-".repeat(cols.saturating_sub(footer.len()));
         println!("{}{}", footer, footer_padding);
+    }
+}
+
+// =============================================================================
+// Event Handlers
+// =============================================================================
+
+impl AgentMonitorPlugin {
+    /// Handle permission request result event
+    fn handle_permission_result(&mut self, _result: PermissionStatus) -> bool {
+        self.append_debug_log("permission: result");
+        true
+    }
+
+    /// Handle command pane opened event
+    fn handle_pane_opened(&mut self, pane_id: u32, context: BTreeMap<String, String>) -> bool {
+        // Only track panes we spawned (have our marker in context)
+        if context.get("agent_monitor").is_some() {
+            // Find the pre-registered agent by agent_id and set its pane_id
+            if let Some(agent_id) = context.get("agent_id") {
+                if let Some(agent) = self.state.agents.iter_mut().find(|a| &a.agent_id == agent_id) {
+                    agent.pane_id = Some(pane_id);
+                }
+            }
+        }
+        true
+    }
+
+    /// Handle command pane exited event
+    fn handle_pane_exited(
+        &mut self,
+        pane_id: u32,
+        exit_code: Option<i32>,
+        _context: BTreeMap<String, String>,
+    ) -> bool {
+        if let Some(agent) = self
+            .state
+            .agents
+            .iter_mut()
+            .find(|a| a.pane_id == Some(pane_id))
+        {
+            agent.status = match exit_code {
+                Some(0) => AgentStatus::Completed,
+                _ => AgentStatus::Failed,
+            };
+        }
+        true
+    }
+
+    /// Handle run command result event
+    fn handle_command_result(
+        &mut self,
+        _exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        _stderr: Vec<u8>,
+        context: BTreeMap<String, String>,
+    ) -> bool {
+        if context.get("kind").map(|s| s.as_str()) == Some("status_read") {
+            if let Some(agent_id) = context.get("agent_id") {
+                let output = String::from_utf8_lossy(&stdout);
+                let parsed = parse_status_content(&output);
+                if let StatusRead::Parsed {
+                    status: new_status,
+                    cwd: new_cwd,
+                } = parsed
+                {
+                    // Use update_agent_status for hysteresis support
+                    self.update_agent_status(agent_id, new_status, new_cwd);
+                }
+            }
+        }
+        true
+    }
+
+    /// Handle pane closed event
+    fn handle_pane_closed(&mut self, pane_id: PaneId) -> bool {
+        if let PaneId::Terminal(id) = pane_id {
+            let was_selected = self
+                .state
+                .agents
+                .get(self.state.selected)
+                .map(|a| a.pane_id == Some(id))
+                .unwrap_or(false);
+
+            // Find agent_id for cleanup before removing
+            let agent_id_to_cleanup = self.state.agents.iter()
+                .find(|a| a.pane_id == Some(id))
+                .map(|a| a.agent_id.clone());
+
+            self.state.agents.retain(|a| a.pane_id != Some(id));
+
+            // Clean up status file if it was our agent
+            if let Some(agent_id) = agent_id_to_cleanup {
+                delete_status_file(&agent_id);
+            }
+
+            // Adjust selection if needed
+            if was_selected && !self.state.agents.is_empty() {
+                self.state.selected = self.state.selected.min(self.state.agents.len() - 1);
+            }
+        }
+        true
+    }
+
+    /// Handle timer event
+    fn handle_timer(&mut self, _elapsed: f64) -> bool {
+        // Increment tick counter for hysteresis timing
+        self.state.tick_count += 1;
+
+        // Advance spinner
+        self.state.spinner_frame = (self.state.spinner_frame + 1) % SPINNER.len();
+
+        if self.state.spinner_frame == 0 {
+            self.push_debug("timer: tick");
+        }
+
+        // Poll status files for all active agents
+        self.poll_status_files();
+
+        // Adaptive polling: fast when working, slow when all idle
+        let has_working = self
+            .state
+            .agents
+            .iter()
+            .any(|a| a.status == AgentStatus::Working);
+
+        set_timeout(if has_working { 0.1 } else { 0.5 });
+
+        // Re-render if there's a working agent (spinner) or needs input
+        has_working
+            || self
+                .state
+                .agents
+                .iter()
+                .any(|a| a.status == AgentStatus::NeedsInput)
+    }
+
+    /// Handle pane update event (spinner detection fallback)
+    fn handle_pane_update(&mut self, manifest: PaneManifest) -> bool {
+        // Spinner detection fallback: detect activity via pane title spinners
+        // Collect agents to update to avoid borrow conflicts
+        let mut spinner_detected: Vec<String> = Vec::new();
+
+        for (_tab_idx, panes) in &manifest.panes {
+            for pane in panes {
+                // Find matching agent by pane_id
+                if let Some(agent) = self.state.agents.iter()
+                    .find(|a| a.pane_id == Some(pane.id))
+                {
+                    let spinner_active = title_has_spinner(&pane.title);
+
+                    // Only use spinner as fallback when hook says Idle
+                    if agent.status == AgentStatus::Idle && spinner_active {
+                        spinner_detected.push(agent.agent_id.clone());
+                    }
+                }
+            }
+        }
+
+        // Apply spinner-based Working status
+        for agent_id in spinner_detected {
+            if let Some(agent) = self.state.agents.iter_mut()
+                .find(|a| a.agent_id == agent_id)
+            {
+                agent.status = AgentStatus::Working;
+                self.state.last_working_tick.insert(
+                    agent_id.clone(),
+                    self.state.tick_count
+                );
+            }
+            self.push_debug(&format!("Fallback: spinner detected for {}", agent_id));
+        }
+        true
+    }
+
+    /// Handle key press event
+    fn handle_key(&mut self, key: KeyWithModifier) -> bool {
+        match key.bare_key {
+            BareKey::Char('j') | BareKey::Down => {
+                if !self.state.agents.is_empty() {
+                    self.state.selected = (self.state.selected + 1) % self.state.agents.len();
+                }
+                true
+            }
+
+            BareKey::Char('k') | BareKey::Up => {
+                if !self.state.agents.is_empty() {
+                    self.state.selected = self.state.selected.saturating_sub(1);
+                }
+                true
+            }
+
+            BareKey::Enter => {
+                if let Some(agent) = self.state.agents.get(self.state.selected) {
+                    if let Some(pane_id) = agent.pane_id {
+                        show_pane_with_id(PaneId::Terminal(pane_id), true);
+                    }
+                }
+                true
+            }
+
+            BareKey::Char('n') => {
+                self.spawn_agent();
+                true
+            }
+
+            BareKey::Char('x') => {
+                if let Some(agent) = self.state.agents.get(self.state.selected) {
+                    if let Some(pane_id) = agent.pane_id {
+                        close_terminal_pane(pane_id);
+                    }
+                }
+                true
+            }
+
+            BareKey::Char('q') | BareKey::Esc => {
+                hide_self();
+                true
+            }
+
+            _ => false,
+        }
     }
 }
 
@@ -445,9 +520,6 @@ impl AgentMonitorPlugin {
             tick: self.state.tick_count,
             message: msg.to_string(),
         });
-
-        // Update debug_last for legacy UI display
-        self.state.debug_last = Some(msg.to_string());
 
         // Also write to host filesystem (bypasses WASI)
         self.write_debug_to_host(msg);
@@ -538,13 +610,13 @@ impl AgentMonitorPlugin {
             let read_result = read_agent_status(&agent.agent_id);
 
             match read_result {
-                StatusRead::Parsed { status, cwd, .. } => {
+                StatusRead::Parsed { status, cwd } => {
                     status_updates.push((agent.agent_id.clone(), status, cwd));
                 }
-                StatusRead::NotFound | StatusRead::ReadError(_) => {
+                StatusRead::NotFound => {
                     pending_command_reads.push(agent.agent_id.clone());
                 }
-                StatusRead::Unrecognized { .. } => {
+                StatusRead::Unrecognized => {
                     // Ignore unrecognized content
                 }
             }
@@ -562,11 +634,18 @@ impl AgentMonitorPlugin {
     }
 
     fn request_status_via_command(&self, agent_id: &str) {
+        // Validate agent_id to prevent command injection
+        if !is_valid_agent_id(agent_id) {
+            return;
+        }
+
+        let (primary_path, fallback_path) = status_file_paths(agent_id);
         let mut context = BTreeMap::new();
         context.insert("kind".to_string(), "status_read".to_string());
         context.insert("agent_id".to_string(), agent_id.to_string());
         let command = format!(
-            "cat /private/tmp/agent-monitor/{agent_id}.status 2>/dev/null || cat /tmp/agent-monitor/{agent_id}.status 2>/dev/null"
+            "cat {} 2>/dev/null || cat {} 2>/dev/null",
+            fallback_path, primary_path
         );
         run_command(
             &[
@@ -576,54 +655,6 @@ impl AgentMonitorPlugin {
             ],
             context,
         );
-    }
-
-    fn handle_key(&mut self, key: KeyWithModifier) -> bool {
-        match key.bare_key {
-            BareKey::Char('j') | BareKey::Down => {
-                if !self.state.agents.is_empty() {
-                    self.state.selected = (self.state.selected + 1) % self.state.agents.len();
-                }
-                true
-            }
-
-            BareKey::Char('k') | BareKey::Up => {
-                if !self.state.agents.is_empty() {
-                    self.state.selected = self.state.selected.saturating_sub(1);
-                }
-                true
-            }
-
-            BareKey::Enter => {
-                if let Some(agent) = self.state.agents.get(self.state.selected) {
-                    if let Some(pane_id) = agent.pane_id {
-                        show_pane_with_id(PaneId::Terminal(pane_id), true);
-                    }
-                }
-                true
-            }
-
-            BareKey::Char('n') => {
-                self.spawn_agent();
-                true
-            }
-
-            BareKey::Char('x') => {
-                if let Some(agent) = self.state.agents.get(self.state.selected) {
-                    if let Some(pane_id) = agent.pane_id {
-                        close_terminal_pane(pane_id);
-                    }
-                }
-                true
-            }
-
-            BareKey::Char('q') | BareKey::Esc => {
-                hide_self();
-                true
-            }
-
-            _ => false,
-        }
     }
 
     fn spawn_agent(&mut self) {
