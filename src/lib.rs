@@ -941,12 +941,14 @@ impl AgentMonitorPlugin {
         context.insert("title".to_string(), title.clone());
 
         // Pass agent_id as env var via env command
+        // Use --dangerously-skip-permissions to avoid permission prompts in dev environment
         open_command_pane_floating(
             CommandToRun {
                 path: PathBuf::from("env"),
                 args: vec![
                     format!("AGENT_MONITOR_ID={}", agent_id),
                     "claude".to_string(),
+                    "--dangerously-skip-permissions".to_string(),
                 ],
                 cwd: None,
             },
